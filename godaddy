@@ -1,19 +1,18 @@
 #!/bin/bash
 # GoDaddy DNS CLI
-# Usage: godaddy <command> [args]
-#
-# Commands:
-#   list <domain>                     - List all DNS records
-#   get <domain> <type> <name>        - Get specific record
-#   add <domain> <type> <name> <data> - Add a record
-#   delete <domain> <type> <name>     - Delete a record
-#   cname <domain> <name> <target>    - Add CNAME record (shortcut)
+VERSION="1.1.0"
 
 set -e
 
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
 # API credentials from environment
 if [[ -z "$GODADDY_KEY" || -z "$GODADDY_SECRET" ]]; then
-    echo "Error: GODADDY_KEY and GODADDY_SECRET environment variables required"
+    echo -e "${RED}Error:${NC} GODADDY_KEY and GODADDY_SECRET environment variables required"
     echo ""
     echo "Get your API keys at: https://developer.godaddy.com/keys"
     echo ""
@@ -27,75 +26,139 @@ API_BASE="https://api.godaddy.com/v1/domains"
 auth_header="Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}"
 
 usage() {
-    echo "GoDaddy DNS CLI"
-    echo ""
-    echo "Usage: godaddy <command> [args]"
-    echo ""
-    echo "Commands:"
-    echo "  list <domain>                      List all DNS records"
-    echo "  get <domain> <type> <name>         Get specific record"
-    echo "  add <domain> <type> <name> <data>  Add/update a record"
-    echo "  delete <domain> <type> <name>      Delete a record"
-    echo "  cname <domain> <name> <target>     Add CNAME (shortcut)"
-    echo "  a <domain> <name> <ip>             Add A record (shortcut)"
-    echo ""
-    echo "Examples:"
-    echo "  godaddy list example.com"
-    echo "  godaddy cname example.com app cname.vercel-dns.com"
-    echo "  godaddy a example.com @ 76.76.21.21"
-    exit 1
+    cat <<EOF
+GoDaddy DNS CLI v${VERSION}
+
+Usage: godaddy <command> [args]
+
+Commands:
+  list <domain> [type]               List DNS records (optionally filter by type)
+  get <domain> <type> <name>         Get specific record
+  add <domain> <type> <name> <data>  Add/update a record
+  delete <domain> <type> <name>      Delete a record
+  cname <domain> <name> <target>     Add CNAME (shortcut)
+  a <domain> <name> <ip>             Add A record (shortcut)
+  domains                            List all domains in account
+
+Options:
+  -v, --version                      Show version
+  -h, --help                         Show this help
+
+Examples:
+  godaddy list example.com
+  godaddy list example.com CNAME
+  godaddy cname example.com app cname.vercel-dns.com
+  godaddy a example.com @ 76.76.21.21
+EOF
+    exit 0
+}
+
+# Make API request and handle errors
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="$3"
+    local response http_code body
+
+    if [[ -n "$data" ]]; then
+        response=$(curl -s -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
+            -H "$auth_header" \
+            -H "Content-Type: application/json" \
+            -d "$data")
+    else
+        response=$(curl -s -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
+            -H "$auth_header")
+    fi
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 400 ]]; then
+        local message=$(echo "$body" | jq -r '.message // .code // "Unknown error"' 2>/dev/null || echo "$body")
+        echo -e "${RED}Error:${NC} $message" >&2
+        return 1
+    fi
+
+    echo "$body"
+}
+
+# Format JSON output (use jq if available, fall back to python)
+format_json() {
+    if command -v jq &>/dev/null; then
+        jq '.'
+    else
+        python3 -m json.tool
+    fi
+}
+
+cmd_domains() {
+    api_request "GET" "" | jq -r '.[].domain' 2>/dev/null || api_request "GET" "" | format_json
 }
 
 cmd_list() {
-    local domain="$1"
-    [[ -z "$domain" ]] && usage
-    curl -s "${API_BASE}/${domain}/records" -H "$auth_header" | python3 -m json.tool
+    local domain="$1" type="$2"
+    [[ -z "$domain" ]] && { echo -e "${RED}Error:${NC} Domain required"; exit 1; }
+
+    if [[ -n "$type" ]]; then
+        api_request "GET" "/${domain}/records/${type}" | format_json
+    else
+        api_request "GET" "/${domain}/records" | format_json
+    fi
 }
 
 cmd_get() {
     local domain="$1" type="$2" name="$3"
-    [[ -z "$domain" || -z "$type" || -z "$name" ]] && usage
-    curl -s "${API_BASE}/${domain}/records/${type}/${name}" -H "$auth_header" | python3 -m json.tool
+    [[ -z "$domain" || -z "$type" || -z "$name" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy get <domain> <type> <name>"; exit 1; }
+    api_request "GET" "/${domain}/records/${type}/${name}" | format_json
 }
 
 cmd_add() {
     local domain="$1" type="$2" name="$3" data="$4" ttl="${5:-600}"
-    [[ -z "$domain" || -z "$type" || -z "$name" || -z "$data" ]] && usage
+    [[ -z "$domain" || -z "$type" || -z "$name" || -z "$data" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy add <domain> <type> <name> <data> [ttl]"; exit 1; }
 
-    curl -s -X PATCH "${API_BASE}/${domain}/records" \
-        -H "$auth_header" \
-        -H "Content-Type: application/json" \
-        -d "[{\"type\":\"${type}\",\"name\":\"${name}\",\"data\":\"${data}\",\"ttl\":${ttl}}]"
-
-    echo "✓ Added ${type} record: ${name}.${domain} → ${data}"
+    if api_request "PATCH" "/${domain}/records" "[{\"type\":\"${type}\",\"name\":\"${name}\",\"data\":\"${data}\",\"ttl\":${ttl}}]" >/dev/null; then
+        echo -e "${GREEN}✓${NC} Added ${type} record: ${name}.${domain} → ${data}"
+    fi
 }
 
 cmd_delete() {
     local domain="$1" type="$2" name="$3"
-    [[ -z "$domain" || -z "$type" || -z "$name" ]] && usage
+    [[ -z "$domain" || -z "$type" || -z "$name" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy delete <domain> <type> <name>"; exit 1; }
 
-    curl -s -X DELETE "${API_BASE}/${domain}/records/${type}/${name}" -H "$auth_header"
-    echo "✓ Deleted ${type} record: ${name}.${domain}"
+    # Confirm deletion
+    echo -e "${YELLOW}Warning:${NC} This will delete ${type} record '${name}' from ${domain}"
+    read -p "Continue? [y/N] " -n 1 -r
+    echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Cancelled."; exit 0; }
+
+    if api_request "DELETE" "/${domain}/records/${type}/${name}" >/dev/null; then
+        echo -e "${GREEN}✓${NC} Deleted ${type} record: ${name}.${domain}"
+    fi
 }
 
 cmd_cname() {
     local domain="$1" name="$2" target="$3"
-    [[ -z "$domain" || -z "$name" || -z "$target" ]] && usage
+    [[ -z "$domain" || -z "$name" || -z "$target" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy cname <domain> <name> <target>"; exit 1; }
     cmd_add "$domain" "CNAME" "$name" "$target"
 }
 
 cmd_a() {
     local domain="$1" name="$2" ip="$3"
-    [[ -z "$domain" || -z "$name" || -z "$ip" ]] && usage
+    [[ -z "$domain" || -z "$name" || -z "$ip" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy a <domain> <name> <ip>"; exit 1; }
     cmd_add "$domain" "A" "$name" "$ip"
 }
 
+# Parse flags
 case "${1:-}" in
-    list)   shift; cmd_list "$@" ;;
-    get)    shift; cmd_get "$@" ;;
-    add)    shift; cmd_add "$@" ;;
-    delete) shift; cmd_delete "$@" ;;
-    cname)  shift; cmd_cname "$@" ;;
-    a)      shift; cmd_a "$@" ;;
-    *)      usage ;;
+    -v|--version) echo "godaddy v${VERSION}"; exit 0 ;;
+    -h|--help)    usage ;;
+    list)         shift; cmd_list "$@" ;;
+    get)          shift; cmd_get "$@" ;;
+    add)          shift; cmd_add "$@" ;;
+    delete)       shift; cmd_delete "$@" ;;
+    cname)        shift; cmd_cname "$@" ;;
+    a)            shift; cmd_a "$@" ;;
+    domains)      cmd_domains ;;
+    "")           usage ;;
+    *)            echo -e "${RED}Error:${NC} Unknown command '$1'"; usage ;;
 esac
