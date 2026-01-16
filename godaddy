@@ -1,0 +1,101 @@
+#!/bin/bash
+# GoDaddy DNS CLI
+# Usage: godaddy <command> [args]
+#
+# Commands:
+#   list <domain>                     - List all DNS records
+#   get <domain> <type> <name>        - Get specific record
+#   add <domain> <type> <name> <data> - Add a record
+#   delete <domain> <type> <name>     - Delete a record
+#   cname <domain> <name> <target>    - Add CNAME record (shortcut)
+
+set -e
+
+# API credentials from environment
+if [[ -z "$GODADDY_KEY" || -z "$GODADDY_SECRET" ]]; then
+    echo "Error: GODADDY_KEY and GODADDY_SECRET environment variables required"
+    echo ""
+    echo "Get your API keys at: https://developer.godaddy.com/keys"
+    echo ""
+    echo "Add to your shell config:"
+    echo "  export GODADDY_KEY='your-key'"
+    echo "  export GODADDY_SECRET='your-secret'"
+    exit 1
+fi
+
+API_BASE="https://api.godaddy.com/v1/domains"
+auth_header="Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}"
+
+usage() {
+    echo "GoDaddy DNS CLI"
+    echo ""
+    echo "Usage: godaddy <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  list <domain>                      List all DNS records"
+    echo "  get <domain> <type> <name>         Get specific record"
+    echo "  add <domain> <type> <name> <data>  Add/update a record"
+    echo "  delete <domain> <type> <name>      Delete a record"
+    echo "  cname <domain> <name> <target>     Add CNAME (shortcut)"
+    echo "  a <domain> <name> <ip>             Add A record (shortcut)"
+    echo ""
+    echo "Examples:"
+    echo "  godaddy list example.com"
+    echo "  godaddy cname example.com app cname.vercel-dns.com"
+    echo "  godaddy a example.com @ 76.76.21.21"
+    exit 1
+}
+
+cmd_list() {
+    local domain="$1"
+    [[ -z "$domain" ]] && usage
+    curl -s "${API_BASE}/${domain}/records" -H "$auth_header" | python3 -m json.tool
+}
+
+cmd_get() {
+    local domain="$1" type="$2" name="$3"
+    [[ -z "$domain" || -z "$type" || -z "$name" ]] && usage
+    curl -s "${API_BASE}/${domain}/records/${type}/${name}" -H "$auth_header" | python3 -m json.tool
+}
+
+cmd_add() {
+    local domain="$1" type="$2" name="$3" data="$4" ttl="${5:-600}"
+    [[ -z "$domain" || -z "$type" || -z "$name" || -z "$data" ]] && usage
+
+    curl -s -X PATCH "${API_BASE}/${domain}/records" \
+        -H "$auth_header" \
+        -H "Content-Type: application/json" \
+        -d "[{\"type\":\"${type}\",\"name\":\"${name}\",\"data\":\"${data}\",\"ttl\":${ttl}}]"
+
+    echo "✓ Added ${type} record: ${name}.${domain} → ${data}"
+}
+
+cmd_delete() {
+    local domain="$1" type="$2" name="$3"
+    [[ -z "$domain" || -z "$type" || -z "$name" ]] && usage
+
+    curl -s -X DELETE "${API_BASE}/${domain}/records/${type}/${name}" -H "$auth_header"
+    echo "✓ Deleted ${type} record: ${name}.${domain}"
+}
+
+cmd_cname() {
+    local domain="$1" name="$2" target="$3"
+    [[ -z "$domain" || -z "$name" || -z "$target" ]] && usage
+    cmd_add "$domain" "CNAME" "$name" "$target"
+}
+
+cmd_a() {
+    local domain="$1" name="$2" ip="$3"
+    [[ -z "$domain" || -z "$name" || -z "$ip" ]] && usage
+    cmd_add "$domain" "A" "$name" "$ip"
+}
+
+case "${1:-}" in
+    list)   shift; cmd_list "$@" ;;
+    get)    shift; cmd_get "$@" ;;
+    add)    shift; cmd_add "$@" ;;
+    delete) shift; cmd_delete "$@" ;;
+    cname)  shift; cmd_cname "$@" ;;
+    a)      shift; cmd_a "$@" ;;
+    *)      usage ;;
+esac
