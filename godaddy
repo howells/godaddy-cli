@@ -1,8 +1,11 @@
 #!/bin/bash
 # GoDaddy DNS CLI
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 set -e
+
+# Handle --version before credential check
+[[ "${1:-}" == "-v" || "${1:-}" == "--version" ]] && echo "godaddy v${VERSION}" && exit 0
 
 # Colors
 RED='\033[0;31m'
@@ -148,9 +151,8 @@ cmd_a() {
     cmd_add "$domain" "A" "$name" "$ip"
 }
 
-# Parse flags
+# Parse commands
 case "${1:-}" in
-    -v|--version) echo "godaddy v${VERSION}"; exit 0 ;;
     -h|--help)    usage ;;
     list)         shift; cmd_list "$@" ;;
     get)          shift; cmd_get "$@" ;;
