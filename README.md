@@ -1,6 +1,6 @@
 # GoDaddy DNS CLI
 
-A simple command-line tool for managing GoDaddy DNS records.
+A command-line tool for managing GoDaddy DNS records. Supports both human and agent workflows with structured JSON output, input validation, and safety rails.
 
 ## Installation
 
@@ -21,8 +21,6 @@ chmod +x /usr/local/bin/godaddy
 
 Get your API credentials at [developer.godaddy.com/keys](https://developer.godaddy.com/keys)
 
-Add to your shell config:
-
 ```bash
 # bash/zsh
 export GODADDY_KEY='your-key'
@@ -39,21 +37,53 @@ set -gx GODADDY_SECRET 'your-secret'
 # List all DNS records
 godaddy list example.com
 
-# Add/update a CNAME record
+# List with field filtering
+godaddy list example.com --fields name,type,data
+
+# Add/update records
 godaddy cname example.com app cname.vercel-dns.com
-
-# Add/update an A record
 godaddy a example.com @ 76.76.21.21
-
-# Add any record type
 godaddy add example.com TXT _verification "verify=abc123"
 
-# Delete a record
+# Preview before mutating
+godaddy add example.com A @ 1.2.3.4 --dry-run
+
+# Delete a record (requires confirmation)
 godaddy delete example.com CNAME app
+godaddy delete example.com CNAME app --yes  # skip prompt
 
 # Get a specific record
 godaddy get example.com A @
+
+# List domains
+godaddy domains
+
+# CLI schema (for agents/tooling)
+godaddy schema
 ```
+
+## Agent / Automation Support
+
+The CLI auto-detects piped contexts and switches to structured JSON output:
+
+```bash
+# Piped output is JSON by default
+godaddy list example.com | jq '.[] | .name'
+
+# Explicit output format
+godaddy list example.com --output json
+
+# Raw JSON input for mutations
+godaddy add example.com --json '[{"type":"A","name":"@","data":"1.2.3.4","ttl":600}]'
+
+# From stdin
+echo '[{"type":"A","name":"@","data":"1.2.3.4","ttl":600}]' | godaddy add example.com --json -
+
+# Full CLI schema for runtime introspection
+godaddy schema
+```
+
+See [AGENTS.md](AGENTS.md) for detailed agent integration guidance.
 
 ## License
 

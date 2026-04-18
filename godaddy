@@ -1,182 +1,446 @@
 #!/bin/bash
 # GoDaddy DNS CLI
-VERSION="1.3.0"
-
+VERSION="2.0.0"
 set -e
 
-# Handle --version and --help before credential check
-[[ "${1:-}" == "-v" || "${1:-}" == "--version" ]] && echo "godaddy v${VERSION}" && exit 0
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" || -z "${1:-}" ]] && {
+# ── Defaults ──────────────────────────────────────────────────────
+# Auto-detect: JSON when piped, text when interactive
+_OUT="text"; [[ ! -t 1 ]] && _OUT="json"
+_DRY=false
+_YES=false
+_FIELDS=""
+_LIMIT=""
+_JSON=""
+
+# ── Parse global flags ───────────────────────────────────────────
+_POS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--version)
+            [[ "$_OUT" == "json" ]] \
+                && printf '{"version":"%s"}\n' "$VERSION" \
+                || echo "godaddy v$VERSION"
+            exit 0 ;;
+        -h|--help)    _POS+=("help"); shift ;;
+        --output)     _OUT="${2:?--output requires value}"; shift 2 ;;
+        --output=*)   _OUT="${1#*=}"; shift ;;
+        --dry-run)    _DRY=true; shift ;;
+        --yes|-y)     _YES=true; shift ;;
+        --fields)     _FIELDS="${2:?--fields requires value}"; shift 2 ;;
+        --fields=*)   _FIELDS="${1#*=}"; shift ;;
+        --limit)      _LIMIT="${2:?--limit requires value}"; shift 2 ;;
+        --limit=*)    _LIMIT="${1#*=}"; shift ;;
+        --json)       _JSON="${2:?--json requires value}"; shift 2 ;;
+        --json=*)     _JSON="${1#*=}"; shift ;;
+        *)            _POS+=("$1"); shift ;;
+    esac
+done
+set -- "${_POS[@]}"
+
+# Read stdin when --json -
+[[ "$_JSON" == "-" ]] && _JSON=$(cat)
+
+# ── Colors (disabled in json mode) ────────────────────────────────
+if [[ "$_OUT" == "text" ]]; then
+    _R='\033[0;31m' _G='\033[0;32m' _Y='\033[0;33m' _N='\033[0m'
+else
+    _R='' _G='' _Y='' _N=''
+fi
+
+# ── Output helpers ────────────────────────────────────────────────
+_ok() {
+    local msg="$1" payload="${2:-}"
+    if [[ "$_OUT" == "json" ]]; then
+        if [[ -n "$payload" ]]; then
+            jq -n --arg m "$msg" --argjson d "$payload" '{ok:true,message:$m,data:$d}'
+        else
+            jq -n --arg m "$msg" '{ok:true,message:$m}'
+        fi
+    else
+        echo -e "${_G}✓${_N} $msg"
+    fi
+}
+
+_err() {
+    local msg="$1" code="${2:-1}"
+    if [[ "$_OUT" == "json" ]]; then
+        jq -n --arg m "$msg" --argjson c "$code" '{ok:false,error:$m,code:$c}' >&2
+    else
+        echo -e "${_R}Error:${_N} $msg" >&2
+    fi
+}
+
+_data() {
+    if [[ -z "$_FIELDS" && -z "$_LIMIT" ]]; then
+        jq '.'
+        return
+    fi
+    local -a jq_args=()
+    local jq_filter='.'
+    if [[ -n "$_FIELDS" ]]; then
+        jq_args+=(--arg f "$_FIELDS")
+        jq_filter+=' | ($f|split(",")) as $k | if type=="array" then [.[]|with_entries(select(.key|IN($k[])))] else with_entries(select(.key|IN($k[]))) end'
+    fi
+    if [[ -n "$_LIMIT" ]]; then
+        jq_args+=(--argjson n "$_LIMIT")
+        jq_filter+=' | if type=="array" then .[:$n] else . end'
+    fi
+    jq "${jq_args[@]}" "$jq_filter"
+}
+
+# ── Input sanitization ───────────────────────────────────────────
+# The agent is not a trusted operator. Reject patterns that exploit
+# URL path construction: traversals, query injection, encoding tricks.
+_sanitize() {
+    local val="$1" label="$2"
+    [[ "$val" == *".."* ]]                 && { _err "$label: path traversal (..) rejected"; exit 1; }
+    [[ "$val" == *"?"* || "$val" == *"#"* ]] && { _err "$label: query/fragment character rejected"; exit 1; }
+    [[ "$val" =~ [[:cntrl:]] ]]            && { _err "$label: control characters rejected"; exit 1; }
+    [[ "$val" =~ %[0-9a-fA-F]{2} ]]       && { _err "$label: percent-encoding rejected"; exit 1; }
+    printf '%s' "$val"
+}
+
+# ── Prerequisites ─────────────────────────────────────────────────
+_require_jq() {
+    command -v jq &>/dev/null || { _err "jq is required. Install: brew install jq (macOS) or apt install jq (Linux)"; exit 1; }
+}
+
+_require_creds() {
+    [[ -n "${GODADDY_KEY:-}" && -n "${GODADDY_SECRET:-}" ]] || {
+        _err "GODADDY_KEY and GODADDY_SECRET environment variables required"
+        exit 1
+    }
+}
+
+# ── API ───────────────────────────────────────────────────────────
+_API="https://api.godaddy.com/v1/domains"
+
+_api() {
+    _require_creds
+    local method="$1" endpoint="$2" body="${3:-}"
+    local -a curl_args=(-s -m 30 -w "\n%{http_code}" -X "$method"
+        -H "Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}")
+    [[ -n "$body" ]] && curl_args+=(-H "Content-Type: application/json" -d "$body")
+
+    local response http_code payload
+    response=$(curl "${curl_args[@]}" "${_API}${endpoint}")
+    http_code=$(echo "$response" | tail -n1)
+    payload=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 400 ]]; then
+        local msg
+        msg=$(echo "$payload" | jq -r '.message // .code // "Unknown error"' 2>/dev/null || echo "$payload")
+        _err "$msg (HTTP $http_code)" "$http_code"
+        return 1
+    fi
+    echo "$payload"
+}
+
+# ── Help ──────────────────────────────────────────────────────────
+_help() {
+    [[ "$_OUT" == "json" ]] && { _schema; return; }
     cat <<EOF
 GoDaddy DNS CLI v${VERSION}
 
-Usage: godaddy <command> [args]
+Usage: godaddy [options] <command> [args]
 
 Commands:
-  list <domain> [type]               List DNS records (optionally filter by type)
-  get <domain> <type> <name>         Get specific record
-  add <domain> <type> <name> <data> [ttl]  Add/update a record (ttl default: 600)
-  delete <domain> <type> <name>      Delete a record
-  cname <domain> <name> <target>     Add CNAME (shortcut)
-  a <domain> <name> <ip>             Add A record (shortcut)
-  domains                            List all domains in account
+  list <domain> [type]                     List DNS records
+  get <domain> <type> <name>               Get specific record
+  add <domain> <type> <name> <data> [ttl]  Add/update a record
+  delete <domain> <type> <name>            Delete a record
+  cname <domain> <name> <target>           Add CNAME (shortcut)
+  a <domain> <name> <ip>                   Add A record (shortcut)
+  domains                                  List all domains
+  schema                                   Output CLI schema as JSON
 
-Options:
-  -v, --version                      Show version
-  -h, --help                         Show this help
+Global Options:
+  --output json|text    Output format (default: auto-detect TTY)
+  --dry-run             Preview mutations without executing
+  --yes, -y             Skip confirmation prompts
+  --fields f1,f2        Filter output to specific fields
+  --limit N             Limit array results to N items
+  --json <payload>      Raw JSON input for add (use - for stdin)
+  -v, --version         Show version
+  -h, --help            Show this help
 
 Examples:
   godaddy list example.com
-  godaddy list example.com CNAME
-  godaddy cname example.com app cname.vercel-dns.com
-  godaddy a example.com @ 76.76.21.21
+  godaddy list example.com --fields name,type,data
+  godaddy add example.com A @ 1.2.3.4 --dry-run
+  godaddy delete example.com CNAME app --yes
+  godaddy add example.com --json '[{"type":"A","name":"@","data":"1.2.3.4","ttl":600}]'
+  echo '<json>' | godaddy add example.com --json -
 EOF
-    exit 0
 }
 
-# Check for required dependencies
-if ! command -v jq &>/dev/null; then
-    echo "Error: jq is required but not installed."
-    echo "Install with: brew install jq (macOS) or apt install jq (Linux)"
-    exit 1
-fi
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
-
-# API credentials from environment
-if [[ -z "$GODADDY_KEY" || -z "$GODADDY_SECRET" ]]; then
-    echo -e "${RED}Error:${NC} GODADDY_KEY and GODADDY_SECRET environment variables required"
-    echo ""
-    echo "Get your API keys at: https://developer.godaddy.com/keys"
-    echo ""
-    echo "Add to your shell config:"
-    echo "  export GODADDY_KEY='your-key'"
-    echo "  export GODADDY_SECRET='your-secret'"
-    exit 1
-fi
-
-API_BASE="https://api.godaddy.com/v1/domains"
-auth_header="Authorization: sso-key ${GODADDY_KEY}:${GODADDY_SECRET}"
-
-# Make API request and handle errors
-api_request() {
-    local method="$1"
-    local endpoint="$2"
-    local data="$3"
-    local response http_code body
-
-    if [[ -n "$data" ]]; then
-        response=$(curl -s -m 30 -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
-            -H "$auth_header" \
-            -H "Content-Type: application/json" \
-            -d "$data")
-    else
-        response=$(curl -s -m 30 -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
-            -H "$auth_header")
-    fi
-
-    http_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | sed '$d')
-
-    if [[ "$http_code" -ge 400 ]]; then
-        local message=$(echo "$body" | jq -r '.message // .code // "Unknown error"' 2>/dev/null || echo "$body")
-        echo -e "${RED}Error:${NC} $message" >&2
-        return 1
-    fi
-
-    echo "$body"
+# ── Schema introspection ─────────────────────────────────────────
+_schema() {
+    cat <<'SCHEMA'
+{
+  "name": "godaddy",
+  "version": "2.0.0",
+  "description": "GoDaddy DNS management CLI",
+  "global_options": {
+    "--output": {
+      "type": "string",
+      "enum": ["json", "text"],
+      "default": "auto (json when piped, text in TTY)",
+      "description": "Output format"
+    },
+    "--dry-run": {
+      "type": "boolean",
+      "default": false,
+      "description": "Preview mutations without executing"
+    },
+    "--yes": {
+      "type": "boolean",
+      "aliases": ["-y"],
+      "default": false,
+      "description": "Skip confirmation prompts"
+    },
+    "--fields": {
+      "type": "string",
+      "description": "Comma-separated field names to include in output",
+      "example": "name,type,data"
+    },
+    "--limit": {
+      "type": "integer",
+      "description": "Limit array results to N items"
+    },
+    "--json": {
+      "type": "string",
+      "description": "Raw JSON payload for add command. Use '-' for stdin"
+    }
+  },
+  "commands": {
+    "list": {
+      "description": "List DNS records for a domain",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": false, "enum": ["A","AAAA","CNAME","MX","NS","SOA","SRV","TXT","CAA"]}
+      ],
+      "mutating": false
+    },
+    "get": {
+      "description": "Get a specific DNS record",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": true, "enum": ["A","AAAA","CNAME","MX","NS","SOA","SRV","TXT","CAA"]},
+        {"name": "name", "type": "string", "required": true, "description": "Record name (@ for root)"}
+      ],
+      "mutating": false
+    },
+    "add": {
+      "description": "Add or update a DNS record",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": true, "enum": ["A","AAAA","CNAME","MX","NS","SOA","SRV","TXT","CAA"]},
+        {"name": "name", "type": "string", "required": true},
+        {"name": "data", "type": "string", "required": true},
+        {"name": "ttl", "type": "integer", "required": false, "default": 600}
+      ],
+      "supports_json_input": true,
+      "supports_dry_run": true,
+      "mutating": true
+    },
+    "delete": {
+      "description": "Delete a DNS record",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "type", "type": "string", "required": true, "enum": ["A","AAAA","CNAME","MX","NS","SOA","SRV","TXT","CAA"]},
+        {"name": "name", "type": "string", "required": true}
+      ],
+      "supports_dry_run": true,
+      "mutating": true,
+      "requires_confirmation": true,
+      "confirmation_skip": "--yes"
+    },
+    "cname": {
+      "description": "Add a CNAME record (shortcut)",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "name", "type": "string", "required": true},
+        {"name": "target", "type": "string", "required": true}
+      ],
+      "supports_dry_run": true,
+      "mutating": true
+    },
+    "a": {
+      "description": "Add an A record (shortcut)",
+      "args": [
+        {"name": "domain", "type": "string", "required": true},
+        {"name": "name", "type": "string", "required": true},
+        {"name": "ip", "type": "string", "required": true}
+      ],
+      "supports_dry_run": true,
+      "mutating": true
+    },
+    "domains": {
+      "description": "List all domains in account",
+      "args": [],
+      "mutating": false
+    },
+    "schema": {
+      "description": "Output full CLI schema as JSON",
+      "args": [],
+      "mutating": false
+    }
+  },
+  "record_types": ["A","AAAA","CNAME","MX","NS","SOA","SRV","TXT","CAA"],
+  "auth": {
+    "method": "environment_variables",
+    "required": ["GODADDY_KEY", "GODADDY_SECRET"],
+    "setup_url": "https://developer.godaddy.com/keys"
+  },
+  "input_validation": {
+    "rejected_patterns": ["path traversal (..)", "query/fragment (? #)", "control characters", "percent-encoding (%XX)"],
+    "security_posture": "The agent is not a trusted operator"
+  }
+}
+SCHEMA
 }
 
-# Format JSON output
-format_json() {
-    jq '.'
-}
-
+# ── Commands ──────────────────────────────────────────────────────
 cmd_domains() {
     local response
-    response=$(api_request "GET" "") || return 1
-    echo "$response" | jq -r '.[].domain' 2>/dev/null || echo "$response" | jq '.'
+    response=$(_api "GET" "") || return 1
+    if [[ "$_OUT" == "text" && -z "$_FIELDS" ]]; then
+        echo "$response" | jq -r '.[].domain'
+    else
+        echo "$response" | _data
+    fi
 }
 
 cmd_list() {
-    local domain="$1" type="$2"
-    [[ -z "$domain" ]] && { echo -e "${RED}Error:${NC} Domain required"; exit 1; }
+    [[ -z "${1:-}" ]] && { _err "Usage: godaddy list <domain> [type]"; exit 1; }
+    local domain type
+    domain=$(_sanitize "$1" "domain") || exit 1
+    type="${2:-}"
 
-    if [[ -n "$type" ]]; then
-        api_request "GET" "/${domain}/records/${type}" | format_json
-    else
-        api_request "GET" "/${domain}/records" | format_json
-    fi
+    local endpoint="/${domain}/records"
+    [[ -n "$type" ]] && {
+        type=$(_sanitize "$type" "type") || exit 1
+        endpoint+="/${type}"
+    }
+
+    _api "GET" "$endpoint" | _data
 }
 
 cmd_get() {
-    local domain="$1" type="$2" name="$3"
-    [[ -z "$domain" || -z "$type" || -z "$name" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy get <domain> <type> <name>"; exit 1; }
-    api_request "GET" "/${domain}/records/${type}/${name}" | format_json
+    [[ -z "${1:-}" || -z "${2:-}" || -z "${3:-}" ]] && { _err "Usage: godaddy get <domain> <type> <name>"; exit 1; }
+    local domain type name
+    domain=$(_sanitize "$1" "domain") || exit 1
+    type=$(_sanitize "$2" "type") || exit 1
+    name=$(_sanitize "$3" "name") || exit 1
+
+    _api "GET" "/${domain}/records/${type}/${name}" | _data
 }
 
 cmd_add() {
-    local domain="$1" type="$2" name="$3" data="$4" ttl="${5:-600}"
-    [[ -z "$domain" || -z "$type" || -z "$name" || -z "$data" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy add <domain> <type> <name> <data> [ttl]"; exit 1; }
+    [[ -z "${1:-}" ]] && { _err "Usage: godaddy add <domain> <type> <name> <data> [ttl]"; exit 1; }
+    local domain
+    domain=$(_sanitize "$1" "domain") || exit 1
 
-    # Validate record type
-    case "$type" in
-        A|AAAA|CNAME|MX|NS|SOA|SRV|TXT|CAA) ;;
-        *) echo -e "${RED}Error:${NC} Invalid record type '$type'. Valid types: A, AAAA, CNAME, MX, NS, SOA, SRV, TXT, CAA"; exit 1 ;;
-    esac
-
-    # Validate TTL is a positive integer
-    [[ ! "$ttl" =~ ^[0-9]+$ ]] && { echo -e "${RED}Error:${NC} TTL must be a positive integer"; exit 1; }
-
-    # Build JSON safely with jq to prevent injection
     local json
-    json=$(jq -n --arg type "$type" --arg name "$name" --arg data "$data" --argjson ttl "$ttl" \
-        '[{type: $type, name: $name, data: $data, ttl: $ttl}]')
+    if [[ -n "$_JSON" ]]; then
+        echo "$_JSON" | jq empty 2>/dev/null || { _err "Invalid JSON payload"; exit 1; }
+        json="$_JSON"
+    else
+        local type="${2:-}" name="${3:-}" data="${4:-}" ttl="${5:-600}"
+        [[ -z "$type" || -z "$name" || -z "$data" ]] && {
+            _err "Usage: godaddy add <domain> <type> <name> <data> [ttl]"
+            exit 1
+        }
 
-    if api_request "PATCH" "/${domain}/records" "$json" >/dev/null; then
-        echo -e "${GREEN}✓${NC} Added ${type} record: ${name}.${domain} → ${data}"
+        case "$type" in
+            A|AAAA|CNAME|MX|NS|SOA|SRV|TXT|CAA) ;;
+            *) _err "Invalid record type '$type'. Valid: A, AAAA, CNAME, MX, NS, SOA, SRV, TXT, CAA"; exit 1 ;;
+        esac
+
+        [[ ! "$ttl" =~ ^[0-9]+$ ]] && { _err "TTL must be a positive integer"; exit 1; }
+
+        json=$(jq -n --arg t "$type" --arg n "$name" --arg d "$data" --argjson ttl "$ttl" \
+            '[{type:$t, name:$n, data:$d, ttl:$ttl}]')
     fi
+
+    if [[ "$_DRY" == true ]]; then
+        if [[ "$_OUT" == "json" ]]; then
+            jq -n --arg d "$domain" --argjson p "$json" \
+                '{dry_run:true, domain:$d, method:"PATCH", payload:$p}'
+        else
+            echo -e "${_Y}[dry-run]${_N} Would PATCH ${domain} with:"
+            echo "$json" | jq '.'
+        fi
+        return 0
+    fi
+
+    _api "PATCH" "/${domain}/records" "$json" >/dev/null
+    local desc
+    desc=$(echo "$json" | jq -r '.[0] | "\(.type) \(.name) → \(.data)"' 2>/dev/null || echo "records")
+    _ok "Added ${desc} to ${domain}" "$json"
 }
 
 cmd_delete() {
-    local domain="$1" type="$2" name="$3"
-    [[ -z "$domain" || -z "$type" || -z "$name" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy delete <domain> <type> <name>"; exit 1; }
+    [[ -z "${1:-}" || -z "${2:-}" || -z "${3:-}" ]] && { _err "Usage: godaddy delete <domain> <type> <name>"; exit 1; }
+    local domain type name
+    domain=$(_sanitize "$1" "domain") || exit 1
+    type=$(_sanitize "$2" "type") || exit 1
+    name=$(_sanitize "$3" "name") || exit 1
 
-    # Confirm deletion
-    echo -e "${YELLOW}Warning:${NC} This will delete ${type} record '${name}' from ${domain}"
-    read -p "Continue? [y/N] " -n 1 -r
-    echo
-    [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Cancelled."; exit 0; }
-
-    if api_request "DELETE" "/${domain}/records/${type}/${name}" >/dev/null; then
-        echo -e "${GREEN}✓${NC} Deleted ${type} record: ${name}.${domain}"
+    if [[ "$_DRY" == true ]]; then
+        if [[ "$_OUT" == "json" ]]; then
+            jq -n --arg d "$domain" --arg t "$type" --arg n "$name" \
+                '{dry_run:true, domain:$d, method:"DELETE", type:$t, name:$n}'
+        else
+            echo -e "${_Y}[dry-run]${_N} Would DELETE ${type} record '${name}' from ${domain}"
+        fi
+        return 0
     fi
+
+    # Safety: require explicit --yes in non-interactive contexts
+    if [[ "$_YES" != true ]]; then
+        if [[ "$_OUT" == "text" && -t 0 ]]; then
+            echo -e "${_Y}Warning:${_N} This will delete ${type} record '${name}' from ${domain}"
+            read -p "Continue? [y/N] " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Cancelled."; exit 0; }
+        else
+            _err "Destructive operation requires --yes flag (or use --dry-run to preview)"
+            exit 1
+        fi
+    fi
+
+    _api "DELETE" "/${domain}/records/${type}/${name}" >/dev/null
+    _ok "Deleted ${type} record: ${name}.${domain}"
 }
 
 cmd_cname() {
-    local domain="$1" name="$2" target="$3"
-    [[ -z "$domain" || -z "$name" || -z "$target" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy cname <domain> <name> <target>"; exit 1; }
-    cmd_add "$domain" "CNAME" "$name" "$target"
+    [[ -z "${1:-}" || -z "${2:-}" || -z "${3:-}" ]] && { _err "Usage: godaddy cname <domain> <name> <target>"; exit 1; }
+    cmd_add "$1" "CNAME" "$2" "$3"
 }
 
 cmd_a() {
-    local domain="$1" name="$2" ip="$3"
-    [[ -z "$domain" || -z "$name" || -z "$ip" ]] && { echo -e "${RED}Error:${NC} Usage: godaddy a <domain> <name> <ip>"; exit 1; }
-    cmd_add "$domain" "A" "$name" "$ip"
+    [[ -z "${1:-}" || -z "${2:-}" || -z "${3:-}" ]] && { _err "Usage: godaddy a <domain> <name> <ip>"; exit 1; }
+    cmd_add "$1" "A" "$2" "$3"
 }
 
-# Parse commands
+# ── Route ─────────────────────────────────────────────────────────
 case "${1:-}" in
-    list)         shift; cmd_list "$@" ;;
-    get)          shift; cmd_get "$@" ;;
-    add)          shift; cmd_add "$@" ;;
-    delete)       shift; cmd_delete "$@" ;;
-    cname)        shift; cmd_cname "$@" ;;
-    a)            shift; cmd_a "$@" ;;
-    domains)      cmd_domains ;;
-    *)            echo -e "${RED}Error:${NC} Unknown command '$1'. Run 'godaddy --help' for usage."; exit 1 ;;
+    help|"")  _help; exit 0 ;;
+    schema)   _require_jq; _schema; exit 0 ;;
+esac
+
+_require_jq
+[[ -n "$_LIMIT" && ! "$_LIMIT" =~ ^[0-9]+$ ]] && { _err "--limit must be a positive integer"; exit 1; }
+
+case "$1" in
+    list)     shift; cmd_list "$@" ;;
+    get)      shift; cmd_get "$@" ;;
+    add)      shift; cmd_add "$@" ;;
+    delete)   shift; cmd_delete "$@" ;;
+    cname)    shift; cmd_cname "$@" ;;
+    a)        shift; cmd_a "$@" ;;
+    domains)  cmd_domains ;;
+    *)        _err "Unknown command '$1'. Run 'godaddy --help' for usage."; exit 1 ;;
 esac
